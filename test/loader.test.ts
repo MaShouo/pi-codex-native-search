@@ -15,6 +15,9 @@ test("Pi 1.1.0 loads the TS package and its vendored description offline", async
   assert.equal(tool.exposure, "hidden");
   assert.ok(tool.description.includes("Tool for accessing the internet."));
   assert.equal(extension.flags.size, 3);
+  assert.ok(extension.commands.has("codex-search"));
+  assert.equal(typeof tool.renderCall, "function");
+  assert.equal(typeof tool.renderResult, "function");
   assert.ok(extension.handlers.has("before_provider_request"));
   assert.ok(extension.handlers.has("message_end"));
   assert.deepEqual(result.runtime.pendingProviderRegistrations, []);

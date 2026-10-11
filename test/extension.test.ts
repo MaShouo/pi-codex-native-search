@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createExtension } from "../src/index.js";
@@ -8,14 +9,17 @@ import type { SearchDetails } from "../src/index.js";
 import type { TransportOptions } from "../src/client.js";
 
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
-function harness(transport: TransportOptions = {}, initialFlags: Record<string, string> = {}) {
+function harness(transport: TransportOptions = {}, initialFlags: Record<string, string> = {}, configurationPath: string | null = null) {
   const tools = new Map<string, Tool>();
   const flags = new Map<string, string | boolean>(Object.entries(initialFlags));
   const handlers = new Map<string, (...args: any[]) => any>();
+  const commands = new Map<string, any>();
+  const notices: { message: string; level: string }[] = [];
   let active: string[] = [];
   const pi = {
     registerFlag(name: string, definition: { default?: string | boolean }) { if (!flags.has(name) && definition.default !== undefined) flags.set(name, definition.default); },
     getFlag(name: string) { return flags.get(name); },
+    registerCommand(name: string, command: unknown) { commands.set(name, command); },
     getActiveTools() { return active; },
     registerTool(tool: Tool) { tools.set(tool.name, tool); if (tool.exposure === "hidden") active = active.filter((name) => name !== tool.name); else if (tool.defaultActive !== false && !active.includes(tool.name)) active.push(tool.name); },
     on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -28,14 +32,15 @@ function harness(transport: TransportOptions = {}, initialFlags: Record<string, 
     { role: "user", content: "current" },
   ] as unknown[], auth: { ok: true, apiKey: "FAKE-KEY", baseUrl: "https://auth.invalid/team/v1", headers: { "x-auth": "auth", "ChatGPT-Account-ID": "account" } } as any };
   const ctx = {
+    hasUI: true, ui: { notify: (message: string, level: string) => notices.push({ message, level }), select: async () => undefined },
     model, sessionManager: {
       getSessionId: () => state.sessionId,
       buildSessionProjection: () => ({ messages: state.messages }),
     }, modelRegistry: { getApiKeyAndHeaders: async () => { authCalls++; return state.auth; } },
   } as unknown as ExtensionContext;
-  createExtension(transport)(pi);
+  createExtension(transport, configurationPath)(pi);
   return {
-    tools, flags, handlers, state, ctx,
+    tools, flags, handlers, state, ctx, commands, notices,
     authCalls: () => authCalls,
     active: () => active,
     disable: () => { active = []; },
@@ -43,6 +48,47 @@ function harness(transport: TransportOptions = {}, initialFlags: Record<string, 
     execute: (params: unknown = { search_query: [{ q: "test" }] }, signal?: AbortSignal) => tools.get("web.run")!.execute("call-one", params as any, signal, undefined, ctx as Parameters<Tool["execute"]>[4]),
   };
 }
+test("mode command persists, updates availability, cancels cleanly and reports CLI overrides", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "search-command-test-"));
+  const path = join(dir, "config.json");
+  try {
+    const sent: any[] = [];
+    const h = harness({ fetch: fakeFetch(async (_url, init) => { sent.push(JSON.parse(init.body as string)); return Response.json({ output: "ok" }); }) }, {}, path);
+    const command = h.commands.get("codex-search");
+    assert.deepEqual(command.getArgumentCompletions("li"), [{ value: "live", label: "live" }]);
+    await command.handler("live", h.ctx);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { mode: "live" });
+    assert.equal(h.tools.get("web.run")!.exposure, "direct");
+    await h.execute();
+    assert.equal(sent.at(-1).settings.external_web_access, true);
+    await command.handler("disabled", h.ctx);
+    assert.equal(h.tools.get("web.run")!.exposure, "hidden");
+    await assert.rejects(h.execute(), /disabled/);
+    await command.handler("indexed", h.ctx);
+    assert.equal(h.tools.get("web.run")!.exposure, "direct");
+    await h.execute();
+    assert.equal(sent.at(-1).settings.external_web_access, "indexed");
+    await writeFile(path, '{"mode":"cached"}');
+    await h.execute();
+    assert.equal(sent.at(-1).settings.external_web_access, false, "file edits are read on next call");
+    const before = await readFile(path, "utf8");
+    await command.handler("", h.ctx);
+    await command.handler("invalid", h.ctx);
+    assert.equal(await readFile(path, "utf8"), before);
+    (h.ctx.ui as any).select = async () => "live";
+    await command.handler("", h.ctx);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { mode: "live" });
+    h.flags.set("codex-search-mode", "cached");
+    await command.handler("live", h.ctx);
+    assert.match(h.notices.at(-1)!.message, /CLI overrides/);
+    assert.equal(h.notices.at(-1)!.level, "warning");
+    await writeFile(path, "{broken");
+    await command.handler("live", h.ctx);
+    assert.equal(h.notices.at(-1)!.level, "error");
+    assert.equal(await readFile(path, "utf8"), "{broken");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 const fakeFetch = (handler: (url: string, init: RequestInit) => Promise<Response>) => handler as typeof fetch;
 
 test("loading, lifecycle and provider switching never resolve auth or make network calls", async () => {

@@ -98,9 +98,43 @@ Pi 内注册名为 `web.run`；在 Responses 请求中转为官方 `web` namespa
 
 不会将第三方网关凭据改发到官方主机，也不跟随 HTTP 重定向。
 
+## 显示
+
+工具调用显示 `Web · Search / Open / Find …` 和搜索词或页面引用，省去参数 JSON。折叠结果显示前三个来源的标题、域名、摘要及执行耗时；展开查看完整文本，内部引用标记转换为可读的 `[turn0search0]`。错误、无结果以及天气等非网页结果也支持精简展示。这里只改变 TUI/HTML 展示，模型收到的原始内容、引用和 details 均保持不变。
+
 ## 配置
 
-使用 Pi extension flags；默认 cached，与官方默认搜索模式一致。要允许 live 外部访问：
+### 会话内切换
+
+```text
+/codex-search             打开模式选择菜单
+/codex-search live        允许实时访问网页
+/codex-search cached      仅使用缓存内容
+/codex-search indexed     仅允许索引范围内的实时访问
+/codex-search disabled    关闭工具
+```
+
+支持参数补全。选择后立即更新工具可用性，并将模式原子写入个人配置，下次启动保留。菜单取消不修改配置。若启动参数覆盖了所选模式，会显示提示。
+
+### 持久配置文件
+
+路径为 `~/.pi/agent/codex-native-search.json`（跟随 `PI_CODING_AGENT_DIR`）。例如：
+
+```json
+{
+  "mode": "live",
+  "maxOutputTokens": 10000,
+  "settings": {}
+}
+```
+
+字段均可省略；没有配置时使用官方默认 cached。每次调用和每轮开始重新读取文件，手动修改后不需要重启；disabled 的隐藏/恢复在下一轮开始生效。配置格式错误会明确报错，不静默覆盖或回退。
+
+优先级为 **CLI 参数 > JSON 配置 > 内置默认值**。`settings` 的 CLI 值整体替换文件中的 settings；CLI mode 会覆盖文件中的 external_web_access，但显式 CLI settings 中的 external_web_access 仍优先。用 `/codex-search` 切换模式会清除文件中的 external_web_access 覆盖，保留其他 settings。
+
+### 单次启动覆盖
+
+使用 Pi extension flags，例如允许 live 外部访问：
 
 ```sh
 pi -e ./src/index.ts --codex-search-mode live

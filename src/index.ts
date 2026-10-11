@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isOpenAIResponsesModel, requestSearch, resolveSearchUrl, searchHeaders, type TransportOptions } from "./client.js";
 import { recentInput } from "./history.js";
-import { readOptions } from "./options.js";
+import { configuredOptions, effectiveMode, saveMode, SEARCH_MODES, type SearchMode } from "./config.js";
+import { searchRenderers } from "./render.js";
 import { CommandsSchema, parseCommands, type SearchRequest } from "./schema.js";
 import { adaptProviderRequest, TOOL_NAME, WEB_DESCRIPTION } from "./wire.js";
 
@@ -17,13 +18,15 @@ export interface SearchDetails {
 }
 
 // Dependency injection is for offline tests. No I/O/auth/model discovery at load.
-export function createExtension(transport: TransportOptions = {}) {
+export function createExtension(transport: TransportOptions = {}, configurationPath?: string | null) {
   return function codexNativeSearch(pi: ExtensionAPI): void {
-    pi.registerFlag("codex-search-mode", { description: "Standalone search: disabled, cached (Codex default), indexed, live", type: "string", default: "cached" });
-    pi.registerFlag("codex-search-max-output-tokens", { description: "Standalone search output token budget (Codex catalog default: 10000)", type: "string", default: "10000" });
-    pi.registerFlag("codex-search-settings", { description: "Optional JSON Codex SearchSettings overrides", type: "string", default: "{}" });
+    pi.registerFlag("codex-search-mode", { description: "Override saved search mode: disabled, cached, indexed, live", type: "string" });
+    pi.registerFlag("codex-search-max-output-tokens", { description: "Override saved search output token budget (default: 10000)", type: "string" });
+    pi.registerFlag("codex-search-settings", { description: "Override saved Codex SearchSettings with JSON", type: "string" });
+    const getOptions = () => configuredOptions((name) => pi.getFlag(name), configurationPath);
 
     const tool = {
+      ...searchRenderers,
       name: TOOL_NAME,
       label: "Codex Web",
       description: WEB_DESCRIPTION,
@@ -34,7 +37,7 @@ export function createExtension(transport: TransportOptions = {}) {
         signal?.throwIfAborted();
         const model = ctx.model;
         if (!model || !isOpenAIResponsesModel(model)) throw new Error("web.run requires an eligible OpenAI Responses provider (same rule as openai-responses-instructions).");
-        const options = readOptions((name) => pi.getFlag(name));
+        const options = getOptions();
         if (!options.enabled) throw new Error("Codex search is disabled.");
         const commands = parseCommands(params);
         const sessionId = ctx.sessionManager.getSessionId();
@@ -71,12 +74,45 @@ export function createExtension(transport: TransportOptions = {}) {
     let available = false;
     let activateOnReturn = true;
     const syncAvailability = (ctx: ExtensionContext) => {
-      const next = isOpenAIResponsesModel(ctx.model) && readOptions((name) => pi.getFlag(name)).enabled;
+      const next = isOpenAIResponsesModel(ctx.model) && getOptions().enabled;
       if (next === available) return;
       if (available) activateOnReturn = pi.getActiveTools().includes(TOOL_NAME);
       available = next;
       pi.registerTool({ ...tool, exposure: next ? "direct" : "hidden", defaultActive: activateOnReturn });
     };
+    pi.registerCommand("codex-search", {
+      description: "Choose and save search mode: live, cached, indexed, disabled",
+      getArgumentCompletions: (prefix) => SEARCH_MODES.filter((mode) => mode.startsWith(prefix.trim().toLowerCase())).map((mode) => ({ value: mode, label: mode })),
+      handler: async (args, ctx) => {
+        try {
+          let choice = args.trim().toLowerCase();
+          if (!choice) {
+            const current = effectiveMode(getOptions());
+            if (!ctx.hasUI) {
+              ctx.ui.notify(`Search mode: ${current}. Usage: /codex-search live|cached|indexed|disabled`, "info");
+              return;
+            }
+            const selected = await ctx.ui.select(`Codex search · ${current}`, [...SEARCH_MODES]);
+            if (selected === undefined) return;
+            choice = selected;
+          }
+          if (!SEARCH_MODES.includes(choice as SearchMode)) {
+            ctx.ui.notify("Usage: /codex-search live|cached|indexed|disabled", "warning");
+            return;
+          }
+          if (configurationPath === null) throw new Error("Persistent configuration is disabled in this test instance.");
+          saveMode(choice as SearchMode, configurationPath);
+          syncAvailability(ctx);
+          const actual = effectiveMode(getOptions());
+          const overridden = actual !== choice;
+          ctx.ui.notify(overridden
+            ? `Saved ${choice}; current mode is ${actual} due to CLI overrides. Restart without the overriding flags to use the saved mode.`
+            : `Codex search: ${actual} · saved.`, overridden ? "warning" : "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : "Unable to change search mode.", "error");
+        }
+      },
+    });
     pi.on("session_start", (_event, ctx) => syncAvailability(ctx));
     pi.on("model_select", (_event, ctx) => syncAvailability(ctx));
     pi.on("before_agent_start", (_event, ctx) => syncAvailability(ctx));
