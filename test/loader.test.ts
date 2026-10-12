@@ -18,6 +18,11 @@ test("Pi 1.1.0 loads the TS package and its vendored description offline", async
   assert.ok(extension.commands.has("codex-search"));
   assert.equal(typeof tool.renderCall, "function");
   assert.equal(typeof tool.renderResult, "function");
+  assert.ok(extension.toolRenderers);
+  assert.equal(extension.toolRenderers.length, 1);
+  const streamed = extension.toolRenderers[0]!("run", () => undefined);
+  assert.equal(streamed?.renderCall, tool.renderCall);
+  assert.equal(streamed?.renderResult, tool.renderResult);
   assert.ok(extension.handlers.has("before_provider_request"));
   assert.ok(extension.handlers.has("message_end"));
   assert.deepEqual(result.runtime.pendingProviderRegistrations, []);

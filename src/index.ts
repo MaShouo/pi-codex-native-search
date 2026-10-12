@@ -71,6 +71,11 @@ export function createExtension(transport: TransportOptions = {}, configurationP
       },
     };
     pi.registerTool({ ...tool, exposure: "hidden" });
+    // The TUI creates and retains its renderer while the provider still calls this
+    // "run". message_end normalizes execution/history to "web.run", too late for
+    // that live component. Fill in the wire-name renderer without claiming a tool
+    // alias or replacing another extension's registered "run" renderer.
+    pi.registerToolRenderer((name, next) => next() ?? (name === "run" ? searchRenderers : undefined));
     let available = false;
     let activateOnReturn = true;
     const syncAvailability = (ctx: ExtensionContext) => {

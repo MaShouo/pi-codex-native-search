@@ -3,7 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ToolExecutionComponent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, type TUI } from "@earendil-works/pi-tui";
+import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
+import { searchRenderers } from "../src/render.js";
 import { createExtension } from "../src/index.js";
 import type { SearchDetails } from "../src/index.js";
 import type { TransportOptions } from "../src/client.js";
@@ -11,6 +14,7 @@ import type { TransportOptions } from "../src/client.js";
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 function harness(transport: TransportOptions = {}, initialFlags: Record<string, string> = {}, configurationPath: string | null = null) {
   const tools = new Map<string, Tool>();
+  const renderers: Parameters<ExtensionAPI["registerToolRenderer"]>[0][] = [];
   const flags = new Map<string, string | boolean>(Object.entries(initialFlags));
   const handlers = new Map<string, (...args: any[]) => any>();
   const commands = new Map<string, any>();
@@ -20,6 +24,7 @@ function harness(transport: TransportOptions = {}, initialFlags: Record<string, 
     registerFlag(name: string, definition: { default?: string | boolean }) { if (!flags.has(name) && definition.default !== undefined) flags.set(name, definition.default); },
     getFlag(name: string) { return flags.get(name); },
     registerCommand(name: string, command: unknown) { commands.set(name, command); },
+    registerToolRenderer(resolver: Parameters<ExtensionAPI["registerToolRenderer"]>[0]) { renderers.push(resolver); },
     getActiveTools() { return active; },
     registerTool(tool: Tool) { tools.set(tool.name, tool); if (tool.exposure === "hidden") active = active.filter((name) => name !== tool.name); else if (tool.defaultActive !== false && !active.includes(tool.name)) active.push(tool.name); },
     on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -40,7 +45,7 @@ function harness(transport: TransportOptions = {}, initialFlags: Record<string, 
   } as unknown as ExtensionContext;
   createExtension(transport, configurationPath)(pi);
   return {
-    tools, flags, handlers, state, ctx, commands, notices,
+    tools, flags, handlers, state, ctx, commands, notices, renderers,
     authCalls: () => authCalls,
     active: () => active,
     disable: () => { active = []; },
@@ -188,6 +193,47 @@ test("native namespace calls normalize before execution and replay only for matc
   (h.ctx.model as any).provider = "unrelated";
   assert.equal(await h.emit("before_provider_request", { payload: { tools: [{ type: "function", name: "web.run" }] } }), undefined);
   assert.equal(await h.emit("message_end", { message: { ...message, provider: "unrelated" } }), undefined);
+});
+
+test("streamed run calls retain compact search rendering through completion without reload", async () => {
+  initTheme("dark");
+  const h = harness();
+  const resolver = h.renderers[0]!;
+  assert.equal(resolver("run", () => undefined), searchRenderers);
+  assert.equal(resolver("unrelated", () => undefined), undefined);
+  const existing = { renderShell: "self" as const };
+  assert.equal(resolver("run", () => existing), existing, "preserve other registered renderers");
+  assert.equal(h.tools.has("run"), false, "the wire alias is presentation-only");
+
+  const args = { search_query: [{ q: "test" }] };
+  const call = { type: "toolCall", id: "streamed-call", name: "run", namespace: "web", arguments: args };
+  const ui = { requestRender() {} } as TUI;
+  // Pi resolves this once at message_update, before message_end normalizes the name.
+  const live = new ToolExecutionComponent(call.name, call.id, {}, { showImages: false }, resolver(call.name, () => undefined), ui, process.cwd());
+  const text = () => stripTerminalSequences(live.render(100).join("\n"));
+  assert.match(text(), /Web.*Preparing request/);
+  live.updateArgs(args);
+  assert.match(text(), /Web.*Search.*test/);
+  assert.doesNotMatch(text(), /"search_query"/);
+  const normalized = await h.emit("message_end", { message: { role: "assistant", provider: "openai-proxy", api: "openai-responses", content: [call] } });
+  assert.equal(normalized.message.content[0].name, "web.run");
+  live.setArgsComplete();
+  live.markExecutionStarted();
+  const output = Array.from({ length: 5 }, (_, i) => `Source ${i} (https://example.com/${i})\n[turn0search${i}] [wordlim: 200] Excerpt ${i}\nBody ${i}\n`).join("\n");
+  const result = { content: [{ type: "text" as const, text: output }], details: {}, isError: false, durationMs: 1200 };
+  live.updateResult(result);
+  assert.match(text(), /5 sources · 1.2s/);
+  assert.match(text(), /\+2 more sources/);
+  assert.doesNotMatch(text(), /Body 4|wordlim/);
+  live.setExpanded(true);
+  assert.match(text(), /Body 4/);
+  live.setExpanded(false);
+  assert.doesNotMatch(text(), /Body 4/);
+
+  const replay = new ToolExecutionComponent("web.run", call.id, args, { showImages: false }, h.tools.get("web.run"), ui, process.cwd());
+  replay.setArgsComplete();
+  replay.updateResult(result);
+  assert.equal(text(), stripTerminalSequences(replay.render(100).join("\n")), "live and replay use the same compact card");
 });
 
 test("oversize output is bounded with exact full output saved, not silently discarded", async () => {
